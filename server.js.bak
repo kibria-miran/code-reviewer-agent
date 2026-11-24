@@ -1,0 +1,68 @@
+import fs from "node:fs";
+import path from "node:path";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { execFileSync } from "node:child_process";
+import { z } from "zod";
+
+const server = new McpServer({ name: "code-reviewer-tools", version: "1.0.0" });
+
+// helper: run a command safely (no shell string = no injection)
+function run(cmd, args, cwd) {
+  try {
+    return execFileSync(cmd, args, {
+      cwd, encoding: "utf8", maxBuffer: 5 * 1024 * 1024, timeout: 120000,
+    });
+  } catch (e) {
+    return `ERROR (exit ${e.status}):\n${e.stdout || ""}\n${e.stderr || e.message}`;
+  }
+}
+
+// TOOL 1: which files changed
+server.tool(
+  "list_changed_files",
+  "List files changed in the git repo (staged + unstaged) vs HEAD.",
+  { repo_path: z.string().describe("Absolute path to the git repo") },
+  async ({ repo_path }) => ({
+    content: [{ type: "text", text: run("git", ["diff", "HEAD", "--name-status"], repo_path) || "No changes." }],
+  })
+);
+
+// TOOL 2: the actual diff (truncated so we don't blow the context)
+server.tool(
+  "get_diff",
+  "Get the git diff for one file, or the whole repo if file is omitted.",
+  {
+    repo_path: z.string(),
+    file: z.string().optional().describe("Relative file path"),
+  },
+  async ({ repo_path, file }) => {
+    const args = ["diff", "HEAD", "--unified=3"];
+    if (file) args.push("--", file);
+    let out = run("git", args, repo_path) || "No diff.";
+    if (out.length > 20000) out = out.slice(0, 20000) + "\n...[TRUNCATED]";
+    return { content: [{ type: "text", text: out }] };
+  }
+);
+
+// TOOL 3: run the project's tests (npm test)
+server.tool(
+  "run_tests",
+  "Run 'npm test' if the repo has a package.json with a test script; otherwise report that no tests exist.",
+  { repo_path: z.string() },
+  async ({ repo_path }) => {
+    const pj = path.join(repo_path, "package.json");
+    if (!fs.existsSync(pj))
+      return { content: [{ type: "text", text: "NO_TESTS: no package.json. Not a failure." }] };
+    const scripts = JSON.parse(fs.readFileSync(pj, "utf8")).scripts || {};
+    if (!scripts.test || scripts.test.includes("no test specified"))
+      return { content: [{ type: "text", text: "NO_TESTS: no real test script. Not a failure." }] };
+    const out = run("npm", ["test", "--silent"], repo_path);
+    return { content: [{ type: "text", text: out.slice(-6000) }] };
+  }
+);
+
+// start server over stdio (Goose launches it as a subprocess)
+await server.connect(new StdioServerTransport());
+
+console.error("CodeReviewer tools server running on stdio");
